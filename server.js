@@ -1,4 +1,4 @@
-// server.js — gpt-server-060kc (Render)용 [ESM 버전]
+// server.js — gpt-server-060kc (Render)용 [ESM + RAG 연동 복구본]
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
@@ -6,15 +6,22 @@ import OpenAI from "openai";
 
 dotenv.config();
 
-console.log("🚀 060KC gpt-server boot :: with /company-chat route");
+console.log("🚀 060KC gpt-server boot :: with /company-chat (RAG) & /chat");
 
-const app = express();
-
-// PORT (Render 필수)
+// ===== 필수 환경 =====
 const PORT = Number(process.env.PORT);
 if (!PORT) { console.error("❌ PORT env missing"); process.exit(1); }
 
-// CORS: 실제 사용하는 도메인만
+// RAG 서버 엔드포인트 (없으면 기본값 사용)
+const RAG_ENDPOINT =
+  process.env.RAG_ENDPOINT || "https://zero60kc-rag.onrender.com/ask";
+
+// RAG 히트 최소 점수(서버의 threshold와 맞추면 가장 안정적)
+const RAG_THRESHOLD = Number(process.env.RAG_THRESHOLD || 0.35);
+
+// ===== 앱 공통 =====
+const app = express();
+
 app.use(cors({
   origin: [
     "https://www.060kc.com",
@@ -22,8 +29,8 @@ app.use(cors({
     "http://localhost:8080",
     "http://127.0.0.1:8080"
   ],
-  methods: ["POST","GET","OPTIONS"],
-  allowedHeaders: ["Content-Type","Authorization"]
+  methods: ["POST", "GET", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"]
 }));
 app.use(express.json({ limit: "2mb" }));
 
@@ -37,16 +44,66 @@ function handoffTemplate() {
 [문의: 070-8231-8295, 평일 09:00–18:00]`;
 }
 
-// 컨텍스트 전용 생성 라우트
+// ----- RAG 호출 유틸 -----
+async function fetchRag(question) {
+  try {
+    const r = await fetch(RAG_ENDPOINT, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      // 서버 구현에 맞게 필요 파라미터 유지
+      body: JSON.stringify({ question, rewrite: true })
+    });
+    const data = await r.json(); // { answer, hits, bestScore?, found? }
+    const hits = Array.isArray(data.hits) ? data.hits : [];
+    const bestScore =
+      typeof data.bestScore === "number"
+        ? data.bestScore
+        : (hits[0]?.score ?? 0);
+
+    // 유효성 판단
+    const found =
+      (data.found === true) ||
+      (hits.length > 0 && bestScore >= RAG_THRESHOLD);
+
+    // 컨텍스트 텍스트(상위 3~5개 정도 합치기)
+    const top = hits.slice(0, 5);
+    const context = top.map(h => (h.text || "").trim()).filter(Boolean).join("\n\n");
+
+    return {
+      found,
+      bestScore,
+      answer: (data.answer || "").trim(),
+      context
+    };
+  } catch (e) {
+    console.error("[RAG fetch error]", e?.message || e);
+    return { found: false, bestScore: 0, answer: "", context: "" };
+  }
+}
+
+// ----- 회사 전용 라우트 (/company-chat) -----
+// 1) 질문 수신
+// 2) RAG에서 회사 QA 검색 → 컨텍스트 구성
+// 3) 컨텍스트가 충분하면 OpenAI가 '회사 문서만'으로 답변
+// 4) 없으면 사람이음 안내
 app.post("/company-chat", async (req, res) => {
   try {
     const question = (req.body?.question || "").trim();
-    const context  = (req.body?.context  || "").trim();
-    if (!question || !context) {
+    if (!question) {
       return res.json({ reply: handoffTemplate(), needs_handoff: true });
     }
 
-    const systemPrompt = `
+    // 1) RAG 호출
+    const rag = await fetchRag(question);
+
+    // 2) RAG에서 답을 직접 주면 그대로 사용 (가장 확실)
+    if (rag.found && rag.answer && rag.answer.replace(/\s/g, "") !== "자료에없음") {
+      return res.json({ reply: rag.answer, needs_handoff: false });
+    }
+
+    // 3) 직접 답이 없더라도 컨텍스트가 있으면, 컨텍스트 제한 답변 시도
+    if (rag.found && rag.context) {
+      const systemPrompt = `
 당신은 060 케이씨(060KC) 회사 문서 전용 상담원입니다.
 아래 CONTEXT(회사 자료)에 포함된 내용만 사용하여 한국어로 간결하고 정확하게 답합니다.
 CONTEXT에 없는 내용은 절대 추정하지 말고 다음 문구로만 답합니다:
@@ -54,36 +111,39 @@ CONTEXT에 없는 내용은 절대 추정하지 말고 다음 문구로만 답�
 문체: 정중하고 간결. 과장/추측/일반지식 사용 금지.
 `.trim();
 
-    const userPrompt = `
+      const userPrompt = `
 [QUESTION]
 ${question}
 
 [CONTEXT]
-${context}
+${rag.context}
 `.trim();
 
-    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-    const r = await openai.chat.completions.create({
-      model: process.env.CHAT_MODEL || "gpt-4o-mini",
-      temperature: 0.2,
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user",   content: userPrompt }
-      ]
-    });
+      const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+      const r = await openai.chat.completions.create({
+        model: process.env.CHAT_MODEL || "gpt-4o-mini",
+        temperature: 0.2,
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userPrompt }
+        ]
+      });
 
-    const reply = r.choices?.[0]?.message?.content?.trim() || "";
-    if (!reply || /자료에 없습니다/i.test(reply)) {
-      return res.json({ reply: handoffTemplate(), needs_handoff: true });
+      const reply = r.choices?.[0]?.message?.content?.trim() || "";
+      if (reply && !/자료에 없습니다/i.test(reply)) {
+        return res.json({ reply, needs_handoff: false });
+      }
     }
-    return res.json({ reply, needs_handoff: false });
+
+    // 4) 여기까지 못 찾으면 사람이음
+    return res.json({ reply: handoffTemplate(), needs_handoff: true });
   } catch (e) {
     console.error("[/company-chat] error:", e?.message || e);
     return res.status(500).json({ reply: handoffTemplate(), needs_handoff: true });
   }
 });
 
-// (옵션) 범용 채팅
+// (옵션) 범용 채팅 그대로 유지
 app.post("/chat", async (req, res) => {
   try {
     const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -93,7 +153,7 @@ app.post("/chat", async (req, res) => {
       temperature: 0.3,
       messages: [
         { role: "system", content: "You are a helpful assistant." },
-        { role: "user",   content: userMessage }
+        { role: "user", content: userMessage }
       ]
     });
     res.json({ reply: r.choices?.[0]?.message?.content ?? "" });
