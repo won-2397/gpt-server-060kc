@@ -1,7 +1,7 @@
 {
   "name": "gpt-server-060kc",
   "version": "1.0.0",
-  "type": "module",                 // ← 이 줄 추가!
+  "type": "module",
   "scripts": {
     "start": "node server.js"
   },
