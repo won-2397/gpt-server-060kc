@@ -6,6 +6,14 @@ import OpenAI from "openai";
 
 dotenv.config();
 
+const FALLBACK_LINES = [
+  "그 사항은 회사 내부 자료에서 검색되지 않습니다.",
+  "회사 내부 자료는 보완하겠습니다.",
+  "오늘은 우선 담당자에게 문의주시기 바랍니다.",
+  "📞 070-8231-8295로 바로 전화하기 / 평일 09:00–18:00"
+];
+const FALLBACK_MSG = FALLBACK_LINES.join("\n");
+
 console.log("🚀 060KC gpt-server boot :: with /company-chat (RAG) & /chat");
 
 const app = express();
@@ -128,7 +136,7 @@ app.post("/company-chat", async (req, res) => {
 
     if (!question) {
       console.warn("[company-chat] empty question body:", req.body);
-      return res.json({ reply: handoffTemplate(), needs_handoff: true });
+      return res.json({ reply: FALLBACK_MSG, needs_handoff: true });
     }
 
     // 1) RAG 호출
@@ -139,6 +147,18 @@ app.post("/company-chat", async (req, res) => {
     if (rag.answer && !isExactNoData(rag.answer) && rag.found) {
       return res.json({ reply: rag.answer, needs_handoff: false });
     }
+
+
+    // 2-1) 내부 자료 미발견 → 즉시 폴백
+    const noData =
+      !rag?.found ||
+      isExactNoData(rag?.answer) ||
+      (typeof rag?.bestScore === "number" && rag.bestScore < RAG_THRESHOLD);
+    if (noData) {
+      return res.json({ reply: FALLBACK_MSG, needs_handoff: true });
+    }
+
+
 
     // 3) 컨텍스트가 있으면 OpenAI로 요약 시도 (found 여부와 무관)
     if (rag.context) {
@@ -177,10 +197,10 @@ ${rag.context}
     }
 
     // 4) 모두 실패 시 사람이음
-    return res.json({ reply: handoffTemplate(), needs_handoff: true });
+    return res.json({ reply: FALLBACK_MSG, needs_handoff: true });
   } catch (e) {
     console.error("[/company-chat] error:", e?.message || e);
-    return res.status(500).json({ reply: handoffTemplate(), needs_handoff: true });
+    return res.status(500).json({ reply: FALLBACK_MSG, needs_handoff: true });
   }
 });
 
